@@ -1,3 +1,10 @@
+<<<<<<< HEAD
+.env
+node_modules/
+venv/
+__pycache__/
+*.pyc
+=======
 # Environment variables
 .env
 .env.local
@@ -33,3 +40,4 @@ build/
 # Database files
 *.sql
 *.sqlite
+>>>>>>> ae33e643c2a85b0c23d8d67220bd303977f3340f
