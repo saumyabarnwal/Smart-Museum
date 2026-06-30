@@ -79,6 +79,42 @@ const verifyPassword = async (password, storedPassword) => {
     return password === storedPassword;
 };
 
+const migratePlainTextPasswords = async () => {
+    try {
+        const usersResult = await query('SELECT user_id, password FROM "user"');
+        let migratedUsers = 0;
+
+        for (const user of usersResult.rows) {
+            if (user.password && !isBcryptHash(user.password)) {
+                await query('UPDATE "user" SET password = $1 WHERE user_id = $2', [
+                    await hashPassword(user.password),
+                    user.user_id
+                ]);
+                migratedUsers += 1;
+            }
+        }
+
+        const adminsResult = await query('SELECT username, password FROM admin');
+        let migratedAdmins = 0;
+
+        for (const admin of adminsResult.rows) {
+            if (admin.password && !isBcryptHash(admin.password)) {
+                await query('UPDATE admin SET password = $1 WHERE username = $2', [
+                    await hashPassword(admin.password),
+                    admin.username
+                ]);
+                migratedAdmins += 1;
+            }
+        }
+
+        console.log(`Password hash migration complete. Users: ${migratedUsers}, Admins: ${migratedAdmins}`);
+    } catch (err) {
+        console.error('Password hash migration failed:', err.message);
+    }
+};
+
+migratePlainTextPasswords();
+
 // ==================== BREVO EMAIL CONFIGURATION ====================
 const BREVO_EMAIL_API_URL = "https://api.brevo.com/v3/smtp/email";
 const brevoSenderEmail = process.env.BREVO_SENDER_EMAIL;
