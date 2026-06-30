@@ -1,11 +1,11 @@
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
-const nodemailer = require("nodemailer");
 const Stripe = require('stripe'); 
 const PDFDocument = require("pdfkit");
 const bwipjs = require("bwip-js");
 const { v4: uuidv4 } = require("uuid");
+const bcrypt = require("bcrypt");
 
 
 require('dotenv').config();
@@ -14,7 +14,8 @@ require('dotenv').config();
 console.log('🔍 Checking environment variables:');
 console.log('STRIPE_SECRET_KEY exists:', !!process.env.STRIPE_SECRET_KEY);
 console.log('SUPABASE_PASSWORD exists:', !!process.env.SUPABASE_PASSWORD);
-console.log('EMAIL_USER exists:', !!process.env.EMAIL_USER);
+console.log('BREVO_API_KEY exists:', !!process.env.BREVO_API_KEY);
+console.log('BREVO_SENDER_EMAIL exists:', !!process.env.BREVO_SENDER_EMAIL);
 
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
@@ -22,6 +23,8 @@ const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const BCRYPT_SALT_ROUNDS = 10;
 
 // ==================== SUPABASE CONNECTION ====================
 const pool = new Pool({
@@ -60,24 +63,93 @@ const query = async (text, params) => {
     }
 };
 
-// ==================== EMAIL CONFIGURATION ====================
-const transporter = nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASSWORD
-    },
-    pool: true,
-    maxConnections: 1
-});
+const hashPassword = (password) => bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
 
-transporter.verify(function(error, success) {
-    if (error) {
-        console.log('❌ Email connection FAILED:', error);
-    } else {
-        console.log('✅ Email server is ready to send messages');
+const isBcryptHash = (password) => typeof password === "string" && /^\$2[aby]\$\d{2}\$/.test(password);
+
+const verifyPassword = async (password, storedPassword) => {
+    if (!storedPassword) {
+        return false;
     }
-});
+
+    if (isBcryptHash(storedPassword)) {
+        return bcrypt.compare(password, storedPassword);
+    }
+
+    return password === storedPassword;
+};
+
+// ==================== BREVO EMAIL CONFIGURATION ====================
+const BREVO_EMAIL_API_URL = "https://api.brevo.com/v3/smtp/email";
+const brevoSenderEmail = process.env.BREVO_SENDER_EMAIL;
+const brevoSenderName = process.env.BREVO_SENDER_NAME || "Smart Museum Jaipur";
+
+if (!process.env.BREVO_API_KEY) {
+    console.log('Brevo API key is missing. Set BREVO_API_KEY in .env');
+} else if (!brevoSenderEmail) {
+    console.log('Brevo sender email is missing. Set BREVO_SENDER_EMAIL in .env');
+} else {
+    console.log('Brevo email API configured');
+}
+
+const sendBrevoEmail = async ({ to, toName, subject, html, attachments = [] }) => {
+    if (!process.env.BREVO_API_KEY) {
+        throw new Error("BREVO_API_KEY is not configured");
+    }
+
+    if (!brevoSenderEmail) {
+        throw new Error("BREVO_SENDER_EMAIL is not configured");
+    }
+
+    const emailPayload = {
+        sender: {
+            name: brevoSenderName,
+            email: brevoSenderEmail
+        },
+        to: [{
+            email: to,
+            name: toName || to
+        }],
+        subject,
+        htmlContent: html
+    };
+
+    if (attachments.length > 0) {
+        emailPayload.attachment = attachments.map(attachment => ({
+            name: attachment.filename,
+            content: Buffer.isBuffer(attachment.content)
+                ? attachment.content.toString("base64")
+                : Buffer.from(attachment.content).toString("base64")
+        }));
+    }
+
+    const response = await fetch(BREVO_EMAIL_API_URL, {
+        method: "POST",
+        headers: {
+            "accept": "application/json",
+            "api-key": process.env.BREVO_API_KEY,
+            "content-type": "application/json"
+        },
+        body: JSON.stringify(emailPayload)
+    });
+
+    const responseText = await response.text();
+    let responseData = {};
+
+    if (responseText) {
+        try {
+            responseData = JSON.parse(responseText);
+        } catch (parseError) {
+            responseData = { raw: responseText };
+        }
+    }
+
+    if (!response.ok) {
+        throw new Error(responseData.message || `Brevo email failed with status ${response.status}`);
+    }
+
+    return responseData;
+};
 
 let adminOtpStore = {};
 let otpStore = {};
@@ -185,8 +257,8 @@ app.post('/api/send-otp', async (req, res) => {
         console.log('🔐 Generated OTP for', email, ':', otp);
 
         const mailOptions = {
-            from: process.env.EMAIL_USER,
             to: email,
+            toName: username,
             subject: 'Password Reset OTP - Smart Museum Jaipur',
             html: `
                 <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -205,29 +277,22 @@ app.post('/api/send-otp', async (req, res) => {
             `
         };
 
-        transporter.sendMail(mailOptions, (error, info) => {
-            if (error) {
-                console.error('❌ Error sending OTP:', error);
-                return res.status(500).json({
-                    success: false,
-                    message: 'Failed to send OTP. Please try again.',
-                    error: error.message
-                });
-            }
-            
-            console.log('✅ OTP sent successfully to:', email);
-            
-            res.json({
-                success: true,
-                message: 'OTP sent successfully to your email',
-                otp: otp
-            });
+        await sendBrevoEmail(mailOptions);
+        console.log('OTP sent successfully to:', email);
+
+        res.json({
+            success: true,
+            message: 'OTP sent successfully to your email',
+            otp: otp
         });
     } catch (err) {
-        console.error('❌ Database error:', err);
+        console.error('❌ Send OTP error:', err);
         return res.status(500).json({
             success: false,
-            message: 'Database error'
+            message: err.message && err.message.includes("BREVO")
+                ? 'Email service is not configured'
+                : 'Failed to send OTP. Please try again.',
+            error: err.message
         });
     }
 });
@@ -292,8 +357,9 @@ app.post('/api/reset-password', async (req, res) => {
     }
 
     try {
+        const hashedPassword = await hashPassword(newPassword);
         const queryText = 'UPDATE "user" SET password = $1 WHERE email = $2';
-        const result = await query(queryText, [newPassword, email]);
+        const result = await query(queryText, [hashedPassword, email]);
 
         if (result.rowCount === 0) {
             return res.status(404).json({
@@ -319,7 +385,7 @@ app.post('/api/reset-password', async (req, res) => {
 
 // REGISTER
 app.post('/api/register', async (req, res) => {
-    console.log('📨 Registration request:', req.body);
+    console.log('Registration request:', { username: req.body.username, email: req.body.email, phone_number: req.body.phone_number, gender: req.body.gender, age: req.body.age });
 
     const { username, email, phone_number, gender, age, password } = req.body;
 
@@ -350,7 +416,8 @@ app.post('/api/register', async (req, res) => {
             VALUES ($1, $2, $3, $4, $5, $6) RETURNING user_id
         `;
 
-        const insertResult = await query(insertQuery, [username, email, phone_number, dbGender, age || null, password]);
+        const hashedPassword = await hashPassword(password);
+        const insertResult = await query(insertQuery, [username, email, phone_number, dbGender, age || null, hashedPassword]);
         
         console.log('✅ User registered successfully. ID:', insertResult.rows[0].user_id);
         res.json({ success: true, message: 'Registration successful!', user_id: insertResult.rows[0].user_id, username });
@@ -371,36 +438,68 @@ app.post('/api/login', async (req, res) => {
     }
 
     try {
-        const queryText = 'SELECT * FROM "user" WHERE username = $1';
-        const result = await query(queryText, [username]);
-        
-        if (result.rows.length === 0) {
+        // 🔥 STEP 1: ADMIN CHECK
+        const adminQuery = 'SELECT * FROM admin WHERE username = $1';
+        const adminResult = await query(adminQuery, [username]);
+
+        if (adminResult.rows.length > 0) {
+            const admin = adminResult.rows[0];
+
+            if (await verifyPassword(password, admin.password)) {
+                if (!isBcryptHash(admin.password)) {
+                    await query("UPDATE admin SET password = $1 WHERE username = $2", [await hashPassword(password), username]);
+                }
+                console.log("✅ Admin login successful");
+
+                return res.json({
+                    success: true,
+                    role: "admin",
+                    admin: {
+                        username: admin.username,
+                        email: admin.email
+                    }
+                });
+            }
+        }
+
+        // 🔥 STEP 2: USER CHECK
+        const userQuery = 'SELECT * FROM "user" WHERE username = $1';
+        const userResult = await query(userQuery, [username]);
+
+        if (userResult.rows.length === 0) {
             return res.status(401).json({ success: false, message: 'Invalid username or password!' });
         }
 
-        const user = result.rows[0];
-        if (password !== user.password) {
+        const user = userResult.rows[0];
+
+        if (!(await verifyPassword(password, user.password))) {
             return res.status(401).json({ success: false, message: 'Invalid username or password!' });
         }
 
-        const userData = {
-            user_id: user.user_id,
-            username: user.username,
-            email: user.email,
-            phone_number: user.phone_number,
-            gender: user.gender,
-            age: user.age
-        };
-        
-        console.log("✅ Login successful, user_id:", user.user_id);
-        res.json({ success: true, message: 'Login successful!', user: userData });
-        
+        if (!isBcryptHash(user.password)) {
+            await query('UPDATE "user" SET password = $1 WHERE user_id = $2', [await hashPassword(password), user.user_id]);
+        }
+
+        console.log("✅ User login successful");
+
+        return res.json({
+            success: true,
+            role: "user",
+            user: {
+                user_id: user.user_id,
+                username: user.username,
+                email: user.email,
+                phone_number: user.phone_number,
+                gender: user.gender,
+                age: user.age
+            }
+        });
+
     } catch (err) {
         console.error('❌ Login error:', err);
         return res.status(500).json({ success: false, message: 'Database error' });
     }
 });
-
 // Get logged in user details
 app.get("/api/user/:id", async (req, res) => {
     const userId = req.params.id;
@@ -442,11 +541,15 @@ app.post("/api/admin/login", async (req, res) => {
         }
 
         const admin = result.rows[0];
-        if (admin.password !== password) {
+        if (!(await verifyPassword(password, admin.password))) {
             return res.status(401).json({
                 success: false,
                 message: "Invalid admin username or password"
             });
+        }
+
+        if (!isBcryptHash(admin.password)) {
+            await query("UPDATE admin SET password = $1 WHERE username = $2", [await hashPassword(password), username]);
         }
 
         console.log("✅ Admin logged in successfully");
@@ -492,16 +595,18 @@ app.post("/api/admin/send-otp", async (req, res) => {
             expires: Date.now() + 5 * 60 * 1000
         };
 
-        transporter.sendMail({
+        await sendBrevoEmail({
             to: email,
             subject: "Admin OTP - Smart Museum",
             html: `<h2>Admin Password Reset</h2><h1>${otp}</h1>`
-        }, err => {
-            if (err) return res.status(500).json({ success: false, message: "Email failed" });
-            res.json({ success: true, message: "OTP sent" });
         });
+        res.json({ success: true, message: "OTP sent" });
     } catch (err) {
-        return res.status(500).json({ success: false, message: "DB error" });
+        return res.status(500).json({
+            success: false,
+            message: err.message && err.message.includes("BREVO") ? "Email service is not configured" : "Email failed",
+            error: err.message
+        });
     }
 });
 
@@ -520,7 +625,8 @@ app.post("/api/admin/reset-password", async (req, res) => {
     const { email, newPassword } = req.body;
 
     try {
-        await query("UPDATE admin SET password = $1 WHERE email = $2", [newPassword, email]);
+        const hashedPassword = await hashPassword(newPassword);
+        await query("UPDATE admin SET password = $1 WHERE email = $2", [hashedPassword, email]);
         delete adminOtpStore[email];
         res.json({ success: true, message: "Password reset successful" });
     } catch (err) {
@@ -895,8 +1001,8 @@ app.post("/api/create-checkout-session", async (req, res) => {
                 gender: gender || "",
                 userId: userId || ""
             },
-            success_url:"http://localhost:5500/frontend/payment-success.html?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url: "http://localhost:5500/payment-cancel.html",
+            success_url:"https://museum-rosy.vercel.app/payment-success.html?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url: "https://museum-rosy.vercel.app/payment-cancel.html",
         });
 
         console.log("✅ Session created:", session.id);
@@ -927,7 +1033,13 @@ app.get("/api/payment-success", async (req, res) => {
         console.log("📦 Session metadata:", metadata);
 
         const { museumName, ticketType, email, visitDate, museumId, userName, userAge, phoneNumber, gender, userId } = metadata;
-
+const selectedDate = new Date(visitDate);
+if (selectedDate.getDay() === 0) {
+    return res.json({
+        success: false,
+        message: "Museums are closed on Sunday. Booking not allowed."
+    });
+}
         if (!email) {
             console.log("❌ ERROR: No email in metadata!");
             return res.json({ success: false, error: "Email not found in session" });
@@ -983,10 +1095,12 @@ app.get("/api/payment-success", async (req, res) => {
         doc.on("end", async () => {
             const pdfData = Buffer.concat(buffers);
             
+            let emailSent = false;
+
             try {
-                const mailResult = await transporter.sendMail({
-                    from: `"Smart Museum Jaipur" <${process.env.EMAIL_USER}>`,
+                const mailResult = await sendBrevoEmail({
                     to: email,
+                    toName: userName || "Guest",
                     subject: "Your Museum Ticket - Smart Museum Jaipur 🎟️",
                     html: `
                         <div style="font-family: Arial, sans-serif; max-width: 600px;">
@@ -1017,6 +1131,7 @@ app.get("/api/payment-success", async (req, res) => {
                 });
 
                 console.log("✅ EMAIL SENT SUCCESSFULLY");
+                emailSent = true;
                 console.log("   Message ID:", mailResult.messageId);
 
             } catch (emailError) {
@@ -1062,7 +1177,7 @@ app.get("/api/payment-success", async (req, res) => {
                     success: true, 
                     message: "Booking confirmed!",
                     bookingId: bookingId,
-                    emailSent: false
+                    emailSent: emailSent
                 });
             } catch (dbError) {
                 console.error("❌ DB Save Error:", dbError);
@@ -1320,3 +1435,4 @@ app.listen(process.env.PORT || 5000, () => {
     console.log(`🔗 Connected to Supabase PostgreSQL`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
+
